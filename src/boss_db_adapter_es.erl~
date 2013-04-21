@@ -1,0 +1,270 @@
+%%%-------------------------------------------------------------------
+%%% @author Jackie dong <>
+%%% @copyright (C) 2010, 2012, Jackie dong
+%%% @doc
+%%%
+%%% @end
+%%% Created : 14 June 2012 by Jackie Dong <>
+%%%-------------------------------------------------------------------
+
+%% provide high level database operations: CRUD
+
+-module(boss_db_adapter_es.erl).
+-compile(export_all).
+
+-include_lib("erlastic_search/include/erlastic_search.hrl").
+
+%% mandatory
+-export([start/1, stop/0, init/1, terminate/1, find/2, find/7]).
+-export([count/3, counter/2, incr/2, incr/3, delete/2, save_record/2]).
+
+%% optional
+-export([execute/2]).
+-export([infer_type_from_id/1]).
+
+-define(LOG(Name, Value), io:format("DEBUG: ~s: ~p~n", [Name, Value])).
+
+% Number of seconds between beginning of gregorian calendar and 1970
+-define(GREGORIAN_SECONDS_1970, 62167219200). 
+
+% JavaScript expression formats to query MongoDB
+-define(CONTAINS_FORMAT, "this.~s.indexOf('~s') != -1").
+-define(NOT_CONTAINS_FORMAT, "this.~s.indexOf('~s') == -1").
+
+start(_Options) ->
+    application:start(erlastic_search).
+
+stop() ->
+    ok.
+
+init(Options) ->
+    Host = proplists:get_value(db_host, Options, "localhost"),
+    Port = proplists:get_value(db_port, Options, 9200),
+    Database = proplists:get_value(db_database, Options, test),
+    % We pass around arguments required by mongo:do/5
+    {ok, {#erls_params{host=Host, port=Port}, Database}}.
+
+terminate({_, _}) ->
+    ok.
+
+find({Params, Index}, Id) when is_list(Id) ->
+    %% Id like: note-xxxxxx
+    %% Type like: note
+    %% Collection like: notes
+    {Type, Collection, ESId} = infer_type_from_id(Id),
+    Res = erls_resource:get(Params, 
+                            filename:join([Index, Type, ESId]), 
+                            [], [], []),
+    case Res of
+        {ok, Json} ->
+            Is_exits = proplists:get_value(<<"exists">>, Json),
+            case Is_exits of
+                true ->
+                    Source = proplists:get_value(<<"_source">>, Json),
+                    {ok, to_record(Type, list_to_binary(Id), Source)};
+                _ ->
+                    {error, not_exists}
+            end;
+        _ ->
+            Res
+    end.
+
+%% Only implement a very simple query_string query at present
+find({Params, Index}, Type, Conditions, Max, Skip, Sort, SortOrder) 
+  when is_atom(Type), is_list(Conditions), 
+       is_integer(Max) orelse Max =:= all, is_integer(Skip), 
+       is_atom(Sort), is_atom(SortOrder) ->
+    case boss_record_lib:ensure_loaded(Type) of
+        true ->
+            Collection = type_to_collection(Type),
+            Res = erlastic_search:search([Index], [Collection], SearchString),
+    case Res of
+        {ok, Json} ->
+            Hits = erlastic_search:get_hits_data(Json),
+            Records = lists:foldl(fun(X, L)->
+                                          Id = proplists:get_value(<<"_id">>, X),
+                                          Source = proplists:get_value(<<"_source">>, X),
+                                          [to_record(Type, Id, Source)|L]
+                                  end, [], Hits),
+            {ok, Records};
+        _ ->
+            Res
+    end.
+
+count(Params, Type, Conditions) ->
+    Collection = type_to_collection(Type),
+    %% build facets
+    %% not implemented yet, just return 10.
+    10.
+
+counter(Params, Id) when is_list(Id) ->
+    10.
+    
+incr(Conn, Id) ->
+    incr(Conn, Id, 1).
+
+incr(Conn, Id, Count) ->
+    11.
+
+delete({Params, Index}, Id) when is_list(Id) ->
+    {_Type, Collection, MongoId} = infer_type_from_id(Id),
+    
+    Res = erlastic_search:delete_doc(Index, Type, Id),
+    case Res of
+        {ok, _} ->
+            ok;
+        _ ->
+            Res
+    end.
+
+save_record({Params, Index}, Record) when is_tuple(Record) ->
+    Type = element(1, Record),
+    Collection = type_to_collection(Type),
+    Res = 
+        case Record:id() of
+            id ->
+                Doc = lists:foldr(fun
+                                      ({id,_}, Acc) -> Acc;
+                                      ({K,V}, Acc) ->
+                                          PackedVal = case is_id_attr(K) of
+                                                          true -> pack_id(V);
+                                                          false -> pack_value(V)
+                                                      end,
+                                          [{K, PackedVal}|Acc]
+                                  end, [], Record:attributes()),
+                erlastic_search:index_doc(Index, Type, Doc);
+            DefinedId when is_list(DefinedId) ->
+                PackedId = pack_id(DefinedId),
+                Doc = lists:map(fun
+                                    ({id,_}) -> {'_id', PackedId};
+                                    ({K,V}) ->
+                                        PackedVal = case is_id_attr(K) of
+                                                        true -> pack_id(V);
+                                                        false -> pack_value(V)
+                                                    end,
+                                        {K, PackedVal}
+                                end, Record:attributes()),
+                erlastic_search:index_doc_with_id(Index, Type, PackedId, Doc)
+           end,
+    case Res of
+        {ok, Json} ->
+            Id = proplists:get_value(<<"_id">>, Json),
+            {ok, Record:set(id, unpack_id(Type, Id))};
+        _ ->
+            Res
+    end.
+
+%% 
+%% Boss models introspection
+%%
+
+infer_type_from_id(Id) when is_list(Id) ->
+    [Type, _BossId] = string:tokens(Id, "-"),
+    {list_to_atom(Type), type_to_collection(Type), pack_id(Id)}.
+
+is_id_attr(AttrName) ->
+    lists:suffix("_id", atom_to_list(AttrName)).
+
+
+%% 
+%% Conversion between Chicago Boss en MongoDB
+%%
+
+% Find MongoDB collection from Boss type
+type_to_collection(Type) ->
+    list_to_atom(type_to_collection_name(Type)).
+
+type_to_collection_name(Type) when is_atom(Type) ->
+    type_to_collection_name(atom_to_list(Type));
+type_to_collection_name(Type) when is_list(Type) ->
+    inflector:pluralize(Type).
+
+% Convert a tuple return by the MongoDB driver to a Boss record
+to_record(Type, Id, Source) ->
+    Args = lists:map(fun
+                         (id) ->
+                             Id;
+                         (X) ->
+                             proplists:get_value(list_to_binary(atom_to_list(X)), Source)
+                     end, boss_record_lib:attribute_names(Type)),
+    apply(Type, new, Args). 
+
+
+% Boss and MongoDB have a different conventions to id attributes (id vs. '_id').
+attr_value(id, Json) ->
+    proplists:get_value(<<"_id">>, Json);
+attr_value(AttrName, Json) ->
+    proplists:get_value(AttrName, Json).
+
+% Id conversions
+pack_id(BossId) ->
+    try
+        [_, ESId] = string:tokens(BossId, "-"),
+        {hex2dec(ESId)}
+    catch
+        Error:Reason -> 
+            error_logger:warning_msg("Error parsing Boss record id: ~p:~p~n", 
+                [Error, Reason]),
+            []
+    end.
+
+unpack_id(Type, ESId) ->
+    lists:concat([Type, "-", binary_to_list(dec2hex(element(1, ESId)))]).
+
+
+% Value conversions
+pack_value({{_, _, _}, {_, _, _}} = Val) ->
+    datetime_to_now(Val);
+pack_value(V) -> V.
+
+datetime_to_now(DateTime) ->
+    GSeconds = calendar:datetime_to_gregorian_seconds(DateTime),
+    ESeconds = GSeconds - ?GREGORIAN_SECONDS_1970,
+    {ESeconds div 1000000, ESeconds rem 1000000, 0}.
+
+
+%%
+%% Decimal to hexadecimal conversion
+%%
+%% Functions below copied from emongo <https://github.com/boorad/emongo>
+%% 
+%% Copyright (c) 2009 Jacob Vorreuter <jacob.vorreuter@gmail.com> 
+%% Jacob Perkins <japerk@gmail.com> 
+%% Belyaev Dmitry <rumata-estor@nm.ru> 
+%% Franois de Metz <fdemetz@af83.com>
+%%
+
+dec2hex(Dec) ->
+    dec2hex(<<>>, Dec).
+
+dec2hex(N, <<I:8,Rem/binary>>) ->
+    dec2hex(<<N/binary, (hex0((I band 16#f0) bsr 4)):8, (hex0((I band 16#0f))):8>>, Rem);
+dec2hex(N,<<>>) ->
+    N.
+
+hex2dec(Hex) when is_list(Hex) ->
+    hex2dec(list_to_binary(Hex));
+
+hex2dec(Hex) ->
+    hex2dec(<<>>, Hex).
+
+hex2dec(N,<<A:8,B:8,Rem/binary>>) ->
+    hex2dec(<<N/binary, ((dec0(A) bsl 4) + dec0(B)):8>>, Rem);
+hex2dec(N,<<>>) ->
+    N.
+
+dec0($a) -> 10;
+dec0($b) -> 11;
+dec0($c) -> 12;
+dec0($d) -> 13;
+dec0($e) -> 14;
+dec0($f) -> 15;
+dec0(X) -> X - $0.
+
+hex0(10) -> $a;
+hex0(11) -> $b;
+hex0(12) -> $c;
+hex0(13) -> $d;
+hex0(14) -> $e;
+hex0(15) -> $f;
+hex0(I) ->  $0 + I.

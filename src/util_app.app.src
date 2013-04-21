@@ -1,0 +1,10 @@
+%% This is the application resource file (.app file) for the erlastic_search,
+%% application.
+{application, util_app, 
+  [{description, "utils"},
+   {vsn, "0.2.0"},
+   {modules, []},
+   {registered,[]},
+   {applications, [kernel, stdlib, sasl, public_key, ssl, crypto, lhttpc]},
+   {start_phases, []}]}.
+

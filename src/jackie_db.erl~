@@ -1,0 +1,74 @@
+-module(jackie_db).
+-compile({parse_transform, exprecs}). 
+-compile(export_all).
+-record(r1, {a, b, c}). 
+-record(r2, {a1, a2}). 
+-record(r3, {f1, f2}).   % note: this record is not exported 
+-export_records([r1,r2]). 
+
+pp(Rec) -> 
+    RF = fun(R, L) when R == element(1,Rec) -> 
+       Flds = '#info-'(fields, Rec), 
+       true = (L == length(Flds)), 
+       Flds 
+    end, 
+    io:fwrite([io_lib_pretty:print(Rec, RF),"\n"]).
+
+%% return a proplists
+attributes(Rec) when is_atom(element(1, Rec))->
+    Type = element(1, Rec),
+    Fields = '#info-'(fields, Rec), 
+    {PL, _} = lists:foldl(fun(Field, {L, N}) ->
+                        {[{Field, element(N, Rec)}|L], N+1}                
+                end, {[], 2}, Fields),
+    lists:reverse(PL).
+
+%% return a list
+to_list(Type) when is_list(Type) ->
+    Type;
+to_list(Type) when is_binary(Type) ->
+    binary_to_list(Type);
+to_list(Type) when is_atom(Type) ->
+    atom_to_list(Type).
+
+attribute_names(Type) ->
+    Fun = "#info-"++ to_list(Type),
+    apply(?MODULE, list_to_atom(Fun), [fields]).
+
+new_default_record(Type) -> 
+    Fun = "#new-"++ to_list(Type),
+    apply(?MODULE, list_to_atom(Fun), []).
+
+new(Type, PropList) ->
+    Fun = "#new-"++ to_list(Type),
+    apply(?MODULE, list_to_atom(Fun), [PropList]).
+
+get(Field, Rec) ->
+    '#get-'(Field, Rec).
+
+set(PropList, Rec) ->
+    '#set-'(PropList, Rec).
+    
+%%
+%% Tests
+%%
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+test() ->
+    R = '#new-r1'([{a,1},{b,2}]),
+    ?assertEqual({r1,1,2,undefined}, R),  
+    ?assertEqual(2, '#get-r1'(b, R)),
+    ?assertEqual(#r1{a = 1,b = 2,c = undefined}, pp(R)),
+    R2 = test3:'#new-r2'(),
+    ?assertEqual({r2,undefined,undefined}, R2).
+
+-endif.
+
+
+
+
+
+
+
+
