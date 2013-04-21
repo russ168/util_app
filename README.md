@@ -1,10 +1,9 @@
-A client for Elastic Search in Erlang.
+Utils
 ======================================
 
-* rebar or sinan
-* uses lhttpc http library
+* utils
 
-QUICKSTART with rebar
+UICKSTART with rebar
 --------------------
 
 ```shell
